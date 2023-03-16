@@ -532,4 +532,324 @@ se_logrr_ff <- function(pos_test, pos_ref, neg_test, neg_ref, adj=0.5){
   return(sqrt((1/a)+(1/c)-(1/(a+b))-(1/(c+d))))
 }
 
-# Pick up at line 755
+
+outcome_events <- outcome_events %>%
+  mutate(events_neg = Total - events1 - eventsm)
+
+# vector of all strain names
+strain_vec <- unique(outcome_events$dominant_variant)
+strain_vec <- strain_vec[!is.na(strain_vec) & strain_vec != "no_strain"]
+
+# Keep track of statistics for each study/outcome combination
+studies_outcomes <- data.frame()
+
+# iterate through pairs of strains
+for (ref.strain in strain_vec) {
+  for (test.strain in strain_vec) {
+    if (ref.strain == test.strain) {
+      next # skip when the two strains are the same
+    }
+    study_rows <- outcome_events %>%
+      filter(dominant_variant %in% c(ref.strain, test.strain)) %>%
+      group_by(site_name, author_year, dominant_variant, outcome) %>%
+      #  dplyr::filter(outcome %in% c("matdeath", "preterm_labor")) %>% 
+      summarise(pos = sum(events1), 
+                neg = sum(events_neg)) %>%
+      mutate(dominant_variant = if_else(dominant_variant==ref.strain,
+                                        "reference",
+                                        "test")) %>%
+      pivot_wider(names_from = dominant_variant, values_from = c("pos", "neg")) %>%
+      drop_na() %>% # drops countries that don't have one or the other dominant strain.
+      mutate(ref.strain=ref.strain, test.strain=test.strain) %>%
+      mutate(logRR = if_else(pos_reference==0 & pos_test==0,
+                             as.numeric(NA),
+                             log(rr_ff(pos_ref=pos_reference, pos_test=pos_test, neg_ref=neg_reference, neg_test=neg_test))),
+             logSE = if_else(pos_reference==0 & pos_test==0,
+                             as.numeric(NA),
+                             se_logrr_ff(pos_ref=pos_reference, pos_test=pos_test, neg_ref=neg_reference, neg_test=neg_test)))
+    
+    studies_outcomes <- rbind(studies_outcomes, study_rows)
+  }
+}
+
+
+# Function to perform meta-analysis (and save/create forest plot)
+# for a given pair of strains
+
+metagen_fun <- function(refstr, teststr) {
+  strainpair_df <- studies_outcomes %>%
+    filter(ref.strain==refstr & test.strain==teststr)
+  # relabel test and ref pos/neg columns to, for example, Omicron+, Omicron-, Delta+, Delta-
+  colnames(strainpair_df)[colnames(strainpair_df) == "pos_reference"] <- paste0(refstr, "+")
+  colnames(strainpair_df)[colnames(strainpair_df) == "neg_reference"] <- paste0(refstr, "-")
+  colnames(strainpair_df)[colnames(strainpair_df) == "pos_test"] <- paste0(teststr, "+")
+  colnames(strainpair_df)[colnames(strainpair_df) == "neg_test"] <- paste0(teststr, "-")
+  
+  if(nrow(strainpair_df)==0){ # when a certain pair of strains is not present, we wnat it to skip, e.g. Delta-Epsilon is missing when dominant strain defined as >=70% prevalence. 
+    print("     No such strain pair found - skipping meta-analysis")
+    return()
+  }
+  
+  ### metagen 
+  mymeta <- metagen(logRR, logSE,
+                    studlab = paste0(site_name, " (", author_year, ")"), data=strainpair_df,
+                    fixed = FALSE, random=TRUE,
+                    subset = NULL, sm = "RR",
+                    method.tau = "ML", # Default Restricted maximum likelihood estimator (REML) did not always converge so using ML. 
+                    subgroup = strainpair_df$outcome,
+                    title = "Variant")
+  
+  # added in the continuity correction by hand - coded it up above
+  # manual process in STATA - replaced 0 with the inverse of the opposite arm. can try this code. Making the continuity correction smaller helps but not always. Pooled absolute risks and pooled relative risks that were illogical, absolute risk was high for one group but relative risk was lower for that group.   If there are 0 events for delta and alpha, what to do with that estimate. 
+  # summary (mymeta)
+  
+  
+  # Extracting the follwing statistics:
+  #
+  # TE.random.w (Estimated effect in subgroup (random effect model))
+  # lower.random.w (CI for the random effects)
+  # upper.random.w (upper CI for the random effects)
+  # k.study.w has number of studies that are included for each random effects model for each outcome given a ref strain and test strain. 
+  # for more info: ?metagen --> then click on "meta.object".
+  # http://127.0.0.1:57661/help/library/meta/help/meta-object
+  
+  strainpair_meta_results <- data.frame(Outcome=mymeta$bylevs, Strain=teststr, Ref_Strain=refstr, 
+                                        RR=exp(mymeta$TE.random.w), LCI=exp(mymeta$lower.random.w), UCI=exp(mymeta$upper.random.w), n_study=mymeta$k.study.w)
+  
+  # generate forest plot and save
+  
+  day_string <- format(Sys.time(), "%Y%m%d")
+  dir_folder_name <- paste0(day_string,"_domvar_mixed_",as.character(dom_threshold*100))
+  dir.create(paste0("plots/",dir_folder_name), recursive = TRUE)
+  pdf(file=paste0("plots/",dir_folder_name,"/VariantStudy_MetaForestPlot_teststr_", teststr, "_refstr_", refstr, ".pdf"), width=10, height=65) # pdf saving has to go before making the plot and at the end have to say dev.off()
+  
+  forest(mymeta, sortvar=logRR,
+         leftcols = c("studlab",
+                      paste0(teststr, "+"), paste0(teststr, "-"),
+                      paste0(refstr, "+"), paste0(refstr, "-")),
+         lab.NA.effect = "NA",
+         colgap.forest.left = "1mm",
+         fontsize = 10,
+         fs.hetstat = 9,
+         header=TRUE,
+         overall=FALSE,
+         col.diamond = "#33CC66",
+         col.study= "#333333")
+  
+  dev.off()
+  return(strainpair_meta_results)
+}
+
+# Perform meta-analysis (and create/save forest plots) for each pair of strains
+
+heatmap_data_df <- data.frame(Outcome = {}, Strain = {}, Ref_Strain = {}, RR = {}, LCI = {}, UCI = {}, n_study = {})
+
+for (ref.strain in strain_vec) {
+  for (test.strain in strain_vec) {
+    if(ref.strain==test.strain) {
+      next # skip this iteration when the two strains are the same. 
+    }
+    print(paste(ref.strain, test.strain))
+    strainpair_results <- metagen_fun(ref.strain, test.strain)
+    heatmap_data_df <- rbind(heatmap_data_df, strainpair_results)
+  }
+}
+
+heatmap_data_df <- heatmap_data_df %>% 
+  mutate(RR_CI_lab = if_else(is.na(RR),
+                             "n=0",
+                             paste0(format(round(RR, 2), nsmall = 2),
+                                    " (",
+                                    format(round(LCI, 2), nsmall = 2),
+                                    ", ",
+                                    format(round(UCI, 2), nsmall = 2),
+                                    "), n=",
+                                    n_study)))
+
+est_table_df <- heatmap_data_df %>%
+  select(-RR, -LCI, -UCI, -n_study) %>%
+  pivot_wider(names_from = Strain, values_from = RR_CI_lab, names_prefix = "Strain_") %>% 
+  pivot_longer(cols = starts_with("Strain_"), names_to = "Strain", values_to = "RR_CI_lab")  %>%
+  mutate(Strain = str_replace(Strain, "Strain_", "")) %>% 
+  mutate(RR_CI_lab = if_else(Strain==Ref_Strain,
+                             "Reference",
+                             if_else(is.na(RR_CI_lab),
+                                     "n=0",
+                                     RR_CI_lab))) %>%
+  pivot_wider(names_from = Strain, values_from = RR_CI_lab)
+
+# Recode labels and re-order
+est_table_df <- est_table_df %>%
+  mutate(Ref_Strain = factor(Ref_Strain, 
+                             levels = c("Pre_alpha", "Alpha", "Beta","Delta", "Epsilon", "Eta", "Omicron", "mixed"),
+                             labels = c("Pre-alpha", "Alpha", "Beta","Delta", "Epsilon", "Eta", "Omicron", "Mixed"))) %>%
+  mutate(Outcome = recode_factor(Outcome, 
+                                 # Adverse Birth outcomes
+                                 "verylowbirthweight" = "vLBW", 
+                                 "lowbirthweight" = "LBW", 
+                                 "extremesga" = "eSGA", 
+                                 "sga" = "SGA",
+                                 "verypreterm" = "vPTB", 
+                                 "verypreterm2" = "vPTB (COVID-19 onset <34w)",
+                                 "preterm" = "PTB",
+                                 "preterm2" = "PTB (COVID-19 onset <37w)",
+                                 "fetal_composite_outcome" = "Fetal composite outcome",
+                                 # fetal & neonatal morbidity & mortality outcomes:
+                                 "stillbirth_28" = "Stillbrith", 
+                                 "perinatal_death28" = "Perinatal death", 
+                                 "earlyneo_death" = "Early neonatal death",  
+                                 "neonatal_death" = "Neonatal death",
+                                 "nicu" = "NICU",
+                                 # Maternal morbidity & mortality
+                                 "prdeath" = "Pregnancy-related death", 
+                                 "place_abrupt" = "Placental abruption", 
+                                 "preterm_labor" = "Preterm labor", 
+                                 "preterm_labor2" = "Preterm labor (COVID-19 onset <37w)",
+                                 "haemorrhage" = "Heamorrhage", 
+                                 "embolicdz" = "Embolic disease",
+                                 "preeclampsia" = "Preeclampsia", 
+                                 "eclampsia" = "Eclampsia", 
+                                 "pre_or_eclampsia" = "Preeclampsia or eclampsia", 
+                                 "hpd_any" = "HDP (diagnosed at any time)",
+                                 "hpd_postcovid" = "HDP (diagnosed at or after COVID-19)",
+                                 "c_section" = "C-section",
+                                 "c_intrap" = "Intrapartum C-section",
+                                 "mat_composite_outcome" = "Maternal composite outcome",
+                                 # Critical care indicators
+                                 "covid_hosp" = "Hospitalization",
+                                 "ICUadmit" = "ICU admission",
+                                 "critcare" = "Critical care",
+                                 "ventilation" = "Ventilation",
+                                 "pneumonia" = "Pneumonia")) %>%
+  ###############!!!!!!!!!!!!!!!!!!!!!!!!!#################################################
+# When threshold is set to ≥70%, manually remove Beta and Epsilon from the line below!! #
+#########################################################################################
+arrange(Outcome, Ref_Strain) %>%
+  select(Outcome, `Reference Strain` = Ref_Strain, `Pre-alpha` = Pre_alpha, Alpha, Beta, Delta, Epsilon, Eta, Omicron, Mixed = mixed)
+
+# Write out est_table_df as a CSV
+day_string <- format(Sys.time(), "%Y%m%d")
+dir_folder_name <- paste0(day_string, "_dom_strain_", as.character(dom_threshold*100))
+dir.create(paste0("data_out/pooled_tables/", dir_folder_name), recursive = TRUE)
+write.csv(est_table_df,
+          paste0("data_out/pooled_tables/",
+                 dir_folder_name, "/Variant_study_pooled_table_", day_string, "_dom_strain_", as.character(dom_threshold*100), ".csv"), row.names = FALSE)
+
+# Create heatmaps, one for each reference strain
+
+outcome_vec <- c("covid_hosp", "ICUadmit", "critcare", "ventilation", "pneumonia",
+                 "prdeath", "place_abrupt", "preterm_labor", "preterm_labor2", "haemorrhage", "embolicdz",
+                 "preeclampsia", "eclampsia", "pre_or_eclampsia", "hpd_any", "hpd_postcovid", "c_section",
+                 "c_intrap","mat_composite_outcome",
+                 # fetal outcomes: 
+                 "stillbirth_28",  "neonatal_death", "earlyneo_death", 
+                 "perinatal_death28", "nicu","lowbirthweight", "verylowbirthweight",
+                 "verypreterm", "verypreterm2", "preterm", "preterm2", "sga", "extremesga", "fetal_composite_outcome")
+#  "stillbirth_site", "sab_site", "tab_site", "perinatal_deathsite"
+
+# Create a list of plots
+plot_list <- list()
+# Loop through each reference strain (rs)
+for (rs in levels(factor(heatmap_data_df$Ref_Strain))) {
+  heatmap_data <- heatmap_data_df %>%
+    filter(Ref_Strain==rs)
+  
+  # Conditional Formatting:
+  heatmap_data <- heatmap_data %>% 
+    mutate(RR_sig = case_when((RR>1.05 & LCI>1 & UCI>1) ~ "RR>1.05, CI-sig",
+                              (RR<0.95 & LCI <1 & UCI<1) ~ "RR<0.95, CI-sig",
+                              TRUE ~ "NS"))
+  
+  heatmap_data$RR_sig <- factor(heatmap_data$RR_sig, 
+                                levels=c("RR>1.05, CI-sig", "RR<0.95, CI-sig", 
+                                         "NS"),
+                                ordered = TRUE)
+  
+  heatmap_data$Outcome <- factor(heatmap_data$Outcome, 
+                                 levels=outcome_vec, 
+                                 ordered = TRUE)
+  
+  myColorScale <- brewer.pal(4,"Set2")
+  names(myColorScale) <- levels(heatmap_data$RR_sig)
+  levels(heatmap_data$RR_sig)
+  
+  colScale <- c("RR>1.05, CI-sig" = "orangered", 
+                "RR<0.95, CI-sig" = "dodgerblue", 
+                "NS" = "gray") 
+  
+  heatmap_data <- heatmap_data %>%
+    mutate(Strain = factor(Strain, 
+                           levels = c("Pre_alpha", "Alpha", "Beta", "Delta", "Epsilon", "Eta", "Omicron", "mixed"),
+                           labels = c("Pre-alpha", "Alpha", "Beta", "Delta", "Epsilon", "Eta", "Omicron", "Mixed"))) %>%
+    mutate(Outcome = recode_factor(Outcome, 
+                                   # Adverse Birth outcomes
+                                   "verylowbirthweight" = "vLBW", 
+                                   "lowbirthweight" = "LBW", 
+                                   "extremesga" = "eSGA", 
+                                   "sga" = "SGA",
+                                   "verypreterm" = "vPTB", 
+                                   "verypreterm2" = "vPTB (COVID-19 onset <34w)",
+                                   "preterm" = "PTB",
+                                   "preterm2" = "PTB (COVID-19 onset <37w)",
+                                   "fetal_composite_outcome" = "Fetal composite outcome",
+                                   # fetal & neonatal morbidity & mortality outcomes:
+                                   "stillbirth_28" = "Stillbrith", 
+                                   "perinatal_death28" = "Perinatal death", 
+                                   "earlyneo_death" = "Early neonatal death",  
+                                   "neonatal_death" = "Neonatal death",
+                                   "nicu" = "NICU",
+                                   # Maternal morbidity & mortality
+                                   "prdeath" = "Pregnancy-related death", 
+                                   "place_abrupt" = "Placental abruption", 
+                                   "preterm_labor" = "Preterm labor", 
+                                   "preterm_labor2" = "Preterm labor (COVID-19 onset <37w)",
+                                   "haemorrhage" = "Heamorrhage", 
+                                   "embolicdz" = "Embolic disease",
+                                   "preeclampsia" = "Preeclampsia", 
+                                   "eclampsia" = "Eclampsia", 
+                                   "pre_or_eclampsia" = "Preeclampsia or eclampsia", 
+                                   "hpd_any" = "HDP (diagnosed at any time)",
+                                   "hpd_postcovid" = "HDP (diagnosed at or after COVID-19)",
+                                   "c_section" = "C-section",
+                                   "c_intrap" = "Intrapartum C-section",
+                                   "mat_composite_outcome" = "Maternal composite outcome",
+                                   # Critical care indicators
+                                   "covid_hosp" = "Hospitalization",
+                                   "ICUadmit" = "ICU admission",
+                                   "critcare" = "Critical care",
+                                   "ventilation" = "Ventilation",
+                                   "pneumonia" = "Pneumonia")) 
+  # "stillbirth_site","perinatal_deathsite", "sab_site", "tab_site",
+  
+  hmap <- heatmap_data %>%
+    filter(n_study>=1) %>%
+    drop_na(Outcome) %>% # Removes NA estimates
+    ggplot() +
+    geom_tile(color="white", alpha=0.8, aes(x = Strain, y=Outcome, fill=RR_sig))+
+    scale_fill_manual(values = colScale) +
+    # geom_text(aes(label=RR_CI_lab), size=2) + 
+    guides(fill=guide_legend((title = "RR & 95%CI"))) +
+    labs(title=paste0("Reference strain: ",rs)) + 
+    theme(plot.title = element_text(hjust = 0.5)) +
+    xlim(levels(heatmap_data$Strain)) + # xlim levels of heatmap_df$Strain retains all strains. 
+    ylim(levels(heatmap_data$Outcome)) + 
+    theme(panel.grid.major.x = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank())
+  #legend.position="none")
+  
+  # Save the plot
+  day_string <- format(Sys.time(), "%Y%m%d")
+  dir_folder_name <- paste0(day_string,"_dom_strain_",as.character(dom_threshold*100))
+  dir.create(paste0("plots/heatmap/",dir_folder_name), recursive = TRUE, showWarnings = FALSE)
+  
+  ggsave(paste0("plots/heatmap/", dir_folder_name, "/variant_study_heatmap_refstrain_", rs, "_n_study>1.pdf"),
+         hmap, width = 8, height = 6, units = "in")
+  
+  variant_plot <- hmap + theme(legend.position="none")
+  plot_list <- append(plot_list, list(variant_plot))
+}
+# Uncomment to display in RStudi'o:
+#
+# hmap_layout <- plot_layout(ncol = 2)
+# plot_list[[1]] + hmap_layout
